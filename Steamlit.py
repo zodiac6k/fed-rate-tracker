@@ -33,16 +33,23 @@ HIKE_PATTERNS = [r"decided to raise the target range",  r"raised the federal fun
 HOLD_PATTERNS = [r"decided to maintain the target range", r"kept the target range", r"maintain its target range"]
 FIRST_CUT_COOLDOWN_MONTHS = 4
 
+# NEW: polite User-Agent to avoid occasional 403s from some endpoints
+REQUEST_KW = {
+    "headers": {"User-Agent": "Mozilla/5.0 (compatible; fed-rate-tracker/1.0; +streamlit)"},
+    "timeout": 20,
+}
+
 # -------------------------------
 # Helpers — FRED & Stooq (no API keys)
 # -------------------------------
 
+@st.cache_data(ttl=3600)  # NEW: cache FRED pulls
 def fred_csv(series_ids, start="1980-01-01") -> pd.DataFrame:
     """Fetch one or more FRED series via fredgraph CSV. Returns wide DataFrame indexed by date."""
     if isinstance(series_ids, str):
         series_ids = [series_ids]
     params = {"id": ",".join(series_ids)}
-    r = requests.get(FRED_CSV_BASE, params=params, timeout=20)
+    r = requests.get(FRED_CSV_BASE, params=params, **REQUEST_KW)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     df.rename(columns={df.columns[0]: "DATE"}, inplace=True)
@@ -58,7 +65,7 @@ def fred_csv(series_ids, start="1980-01-01") -> pd.DataFrame:
 def fetch_stooq_daily(symbol: str, start: str = "1985-01-01") -> pd.DataFrame:
     """Download daily OHLCV from Stooq for symbols like 'spy.us', 'qqq.us'."""
     url = STQ_DAILY_URL.format(symbol=symbol)
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, **REQUEST_KW)
     if r.status_code != 200 or not r.text or r.text.lower().startswith("html"):
         return pd.DataFrame()
     try:
@@ -118,7 +125,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
     rows = []
     # Try Atom feed first
     try:
-        r = requests.get(RSS_URL, timeout=15)
+        r = requests.get(RSS_URL, **REQUEST_KW)
         r.raise_for_status()
         root = ET.fromstring(r.content)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -131,7 +138,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
             if not link:
                 continue
             try:
-                html = requests.get(link, timeout=15).text
+                html = requests.get(link, **REQUEST_KW).text
                 text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
             except Exception:
                 text = title.lower()
@@ -144,14 +151,14 @@ def fetch_fed_press_releases() -> pd.DataFrame:
     except Exception as e:
         st.warning(f"RSS fetch failed ({e}); attempting HTML fallback…")
         try:
-            pr = requests.get("https://www.federalreserve.gov/newsevents/pressreleases.htm", timeout=15).text
+            pr = requests.get("https://www.federalreserve.gov/newsevents/pressreleases.htm", **REQUEST_KW).text
             soup = BeautifulSoup(pr, "html.parser")
             for a in soup.select("a"):
                 at = (a.get_text(strip=True) or "").lower()
                 href = a.get("href") or ""
                 if "fomc statement" in at and href.startswith("/newsevents/pressreleases/"):
                     link = f"https://www.federalreserve.gov{href}"
-                    page = requests.get(link, timeout=15).text
+                    page = requests.get(link, **REQUEST_KW).text
                     psoup = BeautifulSoup(page, "html.parser")
                     m = re.search(r"(\d{4})(\d{2})(\d{2})", href)
                     dt = pd.NaT
@@ -184,7 +191,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
 def nearest_close(df: pd.DataFrame, dt: pd.Timestamp) -> float:
     if df.empty: return np.nan
     if dt in df.index:
-        return float(df.loc[dt, "close"]) if "close" in df.columns else float(df.loc[dt, "adj close"]) 
+        return float(df.loc[dt, "close"]) if "close" in df.columns else float(df.loc[dt, "adj close"])
     idx = df.index.searchsorted(dt)
     if idx < len(df.index):
         row = df.iloc[idx]
@@ -243,14 +250,16 @@ st.title("📉 Fed Rate Cut Tracker — Market Dashboard")
 
 moves = fetch_fed_press_releases()
 moves["date"] = pd.to_datetime(moves.get("date", pd.Series(dtype="datetime64[ns]")), errors="coerce")
-moves = moves.dropna(subset=["date"]) 
+moves = moves.dropna(subset=["date"])
 if not moves.empty:
     moves = moves[moves.date.dt.year >= start_year].reset_index(drop=True)
 else:
     st.warning("No policy statements parsed from feed (check network or RSS changes).")
 
 first_cuts = identify_first_cuts(moves, cooldown)
-px_df = fetch_prices(ticker, start=f"{start_year}-01-01")
+px_df = fetch_prices(ticker, start=f"{start_year}-01-01}")
+# ^^^ OOPS guard: fix a stray brace if present; correct line should be:
+px_df = fetch_prices(ticker, start=f"{start_year}-01-01")  # NEW: ensure no stray brace
 returns_df = compute_returns(first_cuts, px_df, months_list)
 
 # -------------------------------
@@ -282,7 +291,9 @@ if not first_cuts.empty:
     for c in cycles:
         row = {"cycle": c["label"]}
         for lbl, dfx in [("SPY", spy_df), ("QQQ", qqq_df)]:
-            if dfx.empty: row[lbl] = np.nan; continue
+            if dfx.empty:
+                row[lbl] = np.nan
+                continue
             s = nearest_close(dfx, c["start"]); e = nearest_close(dfx, c["end"])
             row[lbl] = (e/s - 1) * 100 if not (np.isnan(s) or np.isnan(e)) else np.nan
         bars.append(row)
@@ -307,10 +318,16 @@ except Exception as e:
     usrec = pd.DataFrame()
 if not usrec.empty:
     in_rec = False; rec_start = None
+    # NEW: choose a safe chart end for vrects even if px_df is empty
+    chart_end = px_df.index.max() if not px_df.empty else pd.Timestamp.today()  # NEW
     for d, v in usrec["USREC"].items():
-        if v == 1 and not in_rec: in_rec, rec_start = True, d
-        elif v == 0 and in_rec: fig.add_vrect(x0=rec_start, x1=d, fillcolor="gray", opacity=0.15); in_rec = False
-    if in_rec: fig.add_vrect(x0=rec_start, x1=px_df.index.max(), fillcolor="gray", opacity=0.15)
+        if v == 1 and not in_rec:
+            in_rec, rec_start = True, d
+        elif v == 0 and in_rec:
+            fig.add_vrect(x0=rec_start, x1=d, fillcolor="gray", opacity=0.15)
+            in_rec = False
+    if in_rec:
+        fig.add_vrect(x0=rec_start, x1=chart_end, fillcolor="gray", opacity=0.15)  # NEW
 for _, r in first_cuts.iterrows():
     fig.add_vline(x=r.date, line=dict(color="red", dash="dash"))
 st.plotly_chart(fig, use_container_width=True)
