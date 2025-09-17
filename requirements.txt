@@ -1,10 +1,7 @@
-streamlit==1.37.1
-pandas==2.0.3         # was 2.2.2
-numpy==1.24.4         # was 1.26.4
-yfinance==0.2.43
-feedparser==6.0.11
-beautifulsoup4==4.12.3
+streamlit==1.39.0
+pandas==2.2.3
+numpy==2.1.2
 requests==2.32.3
-plotly==5.23.0
+beautifulsoup4==4.12.3
+plotly==5.24.1
 python-dateutil==2.9.0.post0
-pandas_datareader==0.10.0
