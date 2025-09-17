@@ -1,9 +1,9 @@
 # streamlit_app.py — Fed Rate Cut Tracker & Macro Dashboard (no yfinance)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Data sources:
-#   - Fed press releases (Atom feed) + HTML fallback
-#   - Index/ETF prices: FRED CSV for S&P 500 (SP500), Stooq CSV for SPY/QQQ
-#   - US recessions & macro: FRED CSV (no API key)
+# - Fed press releases (Atom feed) + HTML fallback
+# - Index/ETF: FRED CSV for SP500, Stooq CSV for SPY/QQQ
+# - US recessions & macro: FRED CSV (no API key)
 #
 # Run locally:
 #   pip install streamlit pandas numpy requests beautifulsoup4 plotly \
@@ -13,6 +13,7 @@
 import io
 import re
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -21,7 +22,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
-import xml.etree.ElementTree as ET
 
 # --- Config
 st.set_page_config(
@@ -57,14 +57,15 @@ FIRST_CUT_COOLDOWN_MONTHS = 4
 REQUEST_KW = {
     "headers": {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; fed-rate-tracker/1.0; +streamlit)"
+            "Mozilla/5.0 "
+            "(compatible; fed-rate-tracker/1.0; +streamlit)"
         )
     },
     "timeout": 20,
 }
 
 # -------------------------------
-# Helpers — FRED & Stooq (no API keys)
+# Helpers — FRED & Stooq
 # -------------------------------
 
 
@@ -72,7 +73,7 @@ REQUEST_KW = {
 def fred_csv(series_ids, start: str = "1980-01-01") -> pd.DataFrame:
     """
     Fetch one or more FRED series via fredgraph CSV.
-    Returns wide DataFrame indexed by date.
+    Returns a wide DataFrame indexed by date.
     """
     if isinstance(series_ids, str):
         series_ids = [series_ids]
@@ -92,9 +93,12 @@ def fred_csv(series_ids, start: str = "1980-01-01") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def fetch_stooq_daily(symbol: str, start: str = "1985-01-01") -> pd.DataFrame:
+def fetch_stooq_daily(
+    symbol: str,
+    start: str = "1985-01-01",
+) -> pd.DataFrame:
     """
-    Download daily OHLCV from Stooq for symbols like 'spy.us', 'qqq.us'.
+    Download daily OHLCV from Stooq, e.g. 'spy.us', 'qqq.us'.
     """
     url = STQ_DAILY_URL.format(symbol=symbol)
     r = requests.get(url, **REQUEST_KW)
@@ -105,7 +109,8 @@ def fetch_stooq_daily(symbol: str, start: str = "1985-01-01") -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-    if df.empty or "Date" not in df.columns or "Close" not in df.columns:
+    ok_cols = "Date" in df.columns and "Close" in df.columns
+    if df.empty or not ok_cols:
         return pd.DataFrame()
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -117,16 +122,19 @@ def fetch_stooq_daily(symbol: str, start: str = "1985-01-01") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def fetch_prices(ticker: str, start: str = "1985-01-01") -> pd.DataFrame:
+def fetch_prices(
+    ticker: str,
+    start: str = "1985-01-01",
+) -> pd.DataFrame:
     """
     Unified price fetcher without yfinance.
     - ^GSPC → FRED 'SP500'
-    - SPY/QQQ (and other US ETFs) → Stooq 'spy.us' / 'qqq.us'
+    - SPY/QQQ → Stooq 'spy.us' / 'qqq.us'
     """
     t = (ticker or "").strip()
     t_upper = t.upper()
 
-    # S&P 500 index via FRED
+    # S&P 500 via FRED
     if t_upper in {"^GSPC", "SPX", "^SPX", "S&P500", "SP500"}:
         try:
             df = fred_csv("SP500", start=start)
@@ -146,7 +154,6 @@ def fetch_prices(ticker: str, start: str = "1985-01-01") -> pd.DataFrame:
     }
     sym = stooq_map.get(t_upper)
     if sym is None:
-        # Fallback: assume US listing, build like 'ticker.us'
         t_lower = t.lower()
         sym = f"{t_lower}.us" if t_lower else None
     if sym:
@@ -156,7 +163,7 @@ def fetch_prices(ticker: str, start: str = "1985-01-01") -> pd.DataFrame:
 
 
 # -------------------------------
-# Fed press releases — Atom feed with HTML fallback
+# Fed press releases — Atom + fallback
 # -------------------------------
 
 
@@ -164,7 +171,7 @@ def fetch_prices(ticker: str, start: str = "1985-01-01") -> pd.DataFrame:
 def fetch_fed_press_releases() -> pd.DataFrame:
     rows = []
 
-    # Try Atom feed first
+    # Atom feed first
     try:
         r = requests.get(RSS_URL, **REQUEST_KW)
         r.raise_for_status()
@@ -174,22 +181,22 @@ def fetch_fed_press_releases() -> pd.DataFrame:
         for e in root.findall(".//atom:entry", ns):
             title = e.findtext("atom:title", namespaces=ns) or ""
             link_el = (
-                e.find("atom:link[@rel='alternate']", ns) or e.find("atom:link", ns)
+                e.find("atom:link[@rel='alternate']", ns) or
+                e.find("atom:link", ns)
             )
             link = link_el.attrib.get("href") if link_el is not None else None
             published = (
-                e.findtext("atom:published", namespaces=ns)
-                or e.findtext("atom:updated", namespaces=ns)
-                or ""
+                e.findtext("atom:published", namespaces=ns) or
+                e.findtext("atom:updated", namespaces=ns) or
+                ""
             )
             published_ts = pd.to_datetime(published, errors="coerce")
             if not link:
                 continue
             try:
                 html = requests.get(link, **REQUEST_KW).text
-                text = BeautifulSoup(
-                    html, "html.parser"
-                ).get_text(" ", strip=True).lower()
+                soup = BeautifulSoup(html, "html.parser")
+                text = soup.get_text(" ", strip=True).lower()
             except Exception:
                 text = title.lower()
 
@@ -214,7 +221,11 @@ def fetch_fed_press_releases() -> pd.DataFrame:
                 }
             )
     except Exception as e:
-        st.warning(f"RSS fetch failed ({e}); attempting HTML fallback…")
+        msg = (
+            "RSS fetch failed "
+            f"({e}); attempting HTML fallback…"
+        )
+        st.warning(msg)
         try:
             pr = requests.get(
                 "https://www.federalreserve.gov/newsevents/pressreleases.htm",
@@ -224,9 +235,9 @@ def fetch_fed_press_releases() -> pd.DataFrame:
             for a in soup.select("a"):
                 at = (a.get_text(strip=True) or "").lower()
                 href = a.get("href") or ""
-                if "fomc statement" in at and href.startswith(
-                    "/newsevents/pressreleases/"
-                ):
+                is_stmt = "fomc statement" in at
+                starts_ok = href.startswith("/newsevents/pressreleases/")
+                if is_stmt and starts_ok:
                     link = f"https://www.federalreserve.gov{href}"
                     page = requests.get(link, **REQUEST_KW).text
                     psoup = BeautifulSoup(page, "html.parser")
@@ -251,11 +262,16 @@ def fetch_fed_press_releases() -> pd.DataFrame:
 
                     title = (
                         psoup.title.get_text(strip=True)
-                        if psoup.title
-                        else "FOMC statement"
+                        if psoup.title else
+                        "FOMC statement"
                     )
                     rows.append(
-                        {"date": dt, "action": action, "title": title, "url": link}
+                        {
+                            "date": dt,
+                            "action": action,
+                            "title": title,
+                            "url": link,
+                        }
                     )
         except Exception as e2:
             st.error(f"Fallback scrape failed: {e2}")
@@ -263,13 +279,14 @@ def fetch_fed_press_releases() -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["date", "action", "title", "url"])
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = (
-            df.dropna(subset=["date"])
-            .sort_values("date")
-            .reset_index(drop=True)
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(
+            drop=True
         )
         mask = df["title"].str.contains(
-            "FOMC statement|Federal Open Market Committee",
+            (
+                "FOMC statement|"
+                "Federal Open Market Committee"
+            ),
             case=False,
             na=False,
         )
@@ -308,23 +325,27 @@ def identify_first_cuts(
     df: pd.DataFrame,
     cooldown_months: int = FIRST_CUT_COOLDOWN_MONTHS,
 ) -> pd.DataFrame:
+    base_cols = ["date", "action", "title", "url"]
     if df.empty or "action" not in df.columns or "date" not in df.columns:
-        return pd.DataFrame(columns=["date", "action", "title", "url"])
+        return pd.DataFrame(columns=base_cols)
     cuts = df[df.action == "cut"].copy()
     if cuts.empty:
-        return pd.DataFrame(columns=["date", "action", "title", "url"])
+        return pd.DataFrame(columns=base_cols)
 
     cuts["prev"] = cuts["date"].shift(1)
 
     def _is_first(r):
         if pd.isna(r.prev):
             return True
-        return (r.date - r.prev) >= pd.DateOffset(months=cooldown_months)
+        delta = r.date - r.prev
+        return delta >= pd.DateOffset(months=cooldown_months)
 
     cuts["is_first"] = cuts.apply(_is_first, axis=1)
-    return cuts[cuts.is_first].drop(
-        columns=["prev", "is_first"], errors="ignore"
-    ).reset_index(drop=True)
+    out = cuts[cuts.is_first].drop(
+        columns=["prev", "is_first"],
+        errors="ignore",
+    )
+    return out.reset_index(drop=True)
 
 
 def compute_returns(
@@ -332,8 +353,8 @@ def compute_returns(
     df: pd.DataFrame,
     months_list=(1, 3, 6),
 ) -> pd.DataFrame:
+    cols = ["date", "title", "url"] + [f"ret_{m}m" for m in months_list]
     if first_cuts.empty or df.empty:
-        cols = ["date", "title", "url"] + [f"ret_{m}m" for m in months_list]
         return pd.DataFrame(columns=cols)
 
     rows = []
@@ -410,14 +431,15 @@ returns_df = compute_returns(first_cuts, px_df, months_list)
 st.subheader("Forward returns per first cut")
 if returns_df.empty:
     st.info(
-        "No first cuts detected in the selected period. Try widening the date "
-        "range or lowering the cooldown."
+        "No first cuts detected in the selected period. Try widening the "
+        "date range or lowering the cooldown."
     )
 else:
     st.dataframe(returns_df.assign(date=returns_df.date.dt.date))
     sel = [m for m in [1, 3, 6] if f"ret_{m}m" in returns_df.columns]
     if sel:
-        sub = returns_df[["date", "title"] + [f"ret_{m}m" for m in sel]].copy()
+        cols = ["date", "title"] + [f"ret_{m}m" for m in sel]
+        sub = returns_df[cols].copy()
         sub.columns = ["date", "title"] + [f"{m}m_%" for m in sel]
         st.markdown("**1/3/6-month summary**")
         st.dataframe(sub.assign(date=sub.date.dt.date))
@@ -428,13 +450,13 @@ else:
 if not first_cuts.empty:
     spy_df = (
         fetch_prices("SPY", start=f"{start_year}-01-01")
-        if show_spy
-        else pd.DataFrame()
+        if show_spy else
+        pd.DataFrame()
     )
     qqq_df = (
         fetch_prices("QQQ", start=f"{start_year}-01-01")
-        if show_qqq
-        else pd.DataFrame()
+        if show_qqq else
+        pd.DataFrame()
     )
     cycles, bars = [], []
     for i, r in first_cuts.reset_index(drop=True).iterrows():
@@ -458,9 +480,8 @@ if not first_cuts.empty:
                 continue
             s = nearest_close(dfx, c["start"])
             e = nearest_close(dfx, c["end"])
-            row[lbl] = (e / s - 1) * 100 if not (
-                np.isnan(s) or np.isnan(e)
-            ) else np.nan
+            ok = not (np.isnan(s) or np.isnan(e))
+            row[lbl] = (e / s - 1) * 100 if ok else np.nan
         bars.append(row)
     perf = pd.DataFrame(bars)
     if not perf.empty:
@@ -475,7 +496,13 @@ else:
 st.subheader("Index with recessions & cut markers")
 fig = go.Figure()
 if not px_df.empty:
-    fig.add_trace(go.Scatter(x=px_df.index, y=px_df["close"], name=ticker))
+    fig.add_trace(
+        go.Scatter(
+            x=px_df.index,
+            y=px_df["close"],
+            name=ticker,
+        )
+    )
 
 try:
     usrec = fred_csv("USREC", start=f"{start_year}-01-01")
@@ -486,12 +513,19 @@ except Exception as e:
 if not usrec.empty:
     in_rec = False
     rec_start = None
-    chart_end = px_df.index.max() if not px_df.empty else pd.Timestamp.today()
+    chart_end = (
+        px_df.index.max() if not px_df.empty else pd.Timestamp.today()
+    )
     for d, v in usrec["USREC"].items():
         if v == 1 and not in_rec:
             in_rec, rec_start = True, d
         elif v == 0 and in_rec:
-            fig.add_vrect(x0=rec_start, x1=d, fillcolor="gray", opacity=0.15)
+            fig.add_vrect(
+                x0=rec_start,
+                x1=d,
+                fillcolor="gray",
+                opacity=0.15,
+            )
             in_rec = False
     if in_rec:
         fig.add_vrect(
@@ -502,7 +536,10 @@ if not usrec.empty:
         )
 
 for _, r in first_cuts.iterrows():
-    fig.add_vline(x=r.date, line=dict(color="red", dash="dash"))
+    fig.add_vline(
+        x=r.date,
+        line=dict(color="red", dash="dash"),
+    )
 
 st.plotly_chart(fig, use_container_width=True)
 
@@ -534,17 +571,17 @@ with st.expander("🔧 Run sanity tests"):
         try:
             cols_ok = {"date", "action", "title", "url"}
             assert cols_ok.issubset(moves.columns), "moves columns missing"
-            assert (
-                pd.api.types.is_datetime64_any_dtype(moves["date"])
-                or moves.empty
-            ), "moves.date not datetime"
-            assert isinstance(first_cuts, pd.DataFrame), "first_cuts not DataFrame"
+            is_dt = pd.api.types.is_datetime64_any_dtype(moves["date"])
+            assert is_dt or moves.empty, "moves.date not datetime"
+            assert isinstance(first_cuts, pd.DataFrame), \
+                "first_cuts not DataFrame"
             if not first_cuts.empty:
                 ok_sorted = (
                     first_cuts["date"].diff().dropna() >= pd.Timedelta(0)
                 ).all()
                 assert ok_sorted, "first_cuts not sorted"
-            assert isinstance(returns_df, pd.DataFrame), "returns_df not DataFrame"
+            assert isinstance(returns_df, pd.DataFrame), \
+                "returns_df not DataFrame"
             st.success("All sanity tests passed.")
         except AssertionError as ae:
             st.error(f"Test failed: {ae}")
