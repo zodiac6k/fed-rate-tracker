@@ -53,6 +53,9 @@ HOLD_PATTERNS = [
 ]
 FIRST_CUT_COOLDOWN_MONTHS = 4
 
+# Policy rate series (FRED)
+RATE_SERIES = ["DFEDTARU", "DFEDTARL", "FEDFUNDS"]
+
 # Polite User-Agent to avoid occasional 403s
 REQUEST_KW = {
     "headers": {
@@ -161,6 +164,30 @@ def fetch_prices(
 
     return pd.DataFrame()
 
+
+@st.cache_data(ttl=3600)
+def fetch_policy_rates(start: str) -> pd.DataFrame:
+    """
+    Returns daily policy rate frame:
+    DFEDTARU (upper), DFEDTARL (lower), FEDFUNDS (effective).
+    """
+    try:
+        df = fred_csv(RATE_SERIES, start=start).copy()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def nearest_value(df: pd.DataFrame, col: str, dt: pd.Timestamp) -> float:
+    """Nearest forward date's value for a given column."""
+    if df.empty or col not in df.columns:
+        return np.nan
+    if dt in df.index:
+        return float(df.loc[dt, col])
+    idx = df.index.searchsorted(dt)
+    if idx < len(df.index):
+        return float(df.iloc[idx][col])
+    return np.nan
 
 # -------------------------------
 # Fed press releases — Atom + fallback
@@ -293,7 +320,6 @@ def fetch_fed_press_releases() -> pd.DataFrame:
         df = df.loc[mask].reset_index(drop=True)
     return df
 
-
 # -------------------------------
 # Return math
 # -------------------------------
@@ -348,27 +374,72 @@ def identify_first_cuts(
     return out.reset_index(drop=True)
 
 
+def annotate_rates(
+    events: pd.DataFrame,
+    rates: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Adds rate_lower, rate_upper, rate_mid, eff_rate and delta_mid_bps
+    from the prior first-cut event.
+    """
+    if events.empty or rates.empty:
+        return events
+
+    out = events.copy().sort_values("date").reset_index(drop=True)
+    lows, ups, mids, effs = [], [], [], []
+    for _, r in out.iterrows():
+        d = r.date
+        lo = nearest_value(rates, "DFEDTARL", d)
+        up = nearest_value(rates, "DFEDTARU", d)
+        eff = nearest_value(rates, "FEDFUNDS", d)
+        mid = np.nanmean([lo, up]) if not np.isnan(lo + up) else np.nan
+        lows.append(lo)
+        ups.append(up)
+        mids.append(mid)
+        effs.append(eff)
+
+    out["rate_lower"] = lows
+    out["rate_upper"] = ups
+    out["rate_mid"] = mids
+    out["eff_rate"] = effs
+
+    out["delta_mid_bps"] = (
+        (out["rate_mid"].diff()) * 100 if out["rate_mid"].notna().any()
+        else np.nan
+    )
+    return out
+
+
 def compute_returns(
     first_cuts: pd.DataFrame,
-    df: pd.DataFrame,
+    px_main: pd.DataFrame,
     months_list=(1, 3, 6),
+    px_spy: pd.DataFrame | None = None,
+    px_qqq: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     cols = ["date", "title", "url"] + [f"ret_{m}m" for m in months_list]
-    if first_cuts.empty or df.empty:
+    if px_spy is not None:
+        cols += [f"spy_{m}m" for m in months_list]
+    if px_qqq is not None:
+        cols += [f"qqq_{m}m" for m in months_list]
+
+    if first_cuts.empty or px_main.empty:
         return pd.DataFrame(columns=cols)
 
     rows = []
     for _, r in first_cuts.iterrows():
-        entry = {
-            "date": r.date,
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-        }
+        d = r.date
+        entry = {"date": d, "title": r.get("title", ""), "url": r.get("url", "")}
         for m in months_list:
-            entry[f"ret_{m}m"] = fwd_return(df, r.date, m)
+            entry[f"ret_{m}m"] = fwd_return(px_main, d, m)
+            if px_spy is not None:
+                entry[f"spy_{m}m"] = fwd_return(px_spy, d, m)
+            if px_qqq is not None:
+                entry[f"qqq_{m}m"] = fwd_return(px_qqq, d, m)
         rows.append(entry)
 
-    return pd.DataFrame(rows).sort_values("date")
+    df = pd.DataFrame(rows).sort_values("date")
+    return df
 
 
 # -------------------------------
@@ -423,7 +494,30 @@ else:
 
 first_cuts = identify_first_cuts(moves, cooldown)
 px_df = fetch_prices(ticker, start=f"{start_year}-01-01")
-returns_df = compute_returns(first_cuts, px_df, months_list)
+
+# policy rates and annotations
+rate_df = fetch_policy_rates(start=f"{start_year}-01-01")
+first_cuts_rates = annotate_rates(first_cuts, rate_df)
+
+# optional SPY/QQQ series for table
+spy_df = (
+    fetch_prices("SPY", start=f"{start_year}-01-01")
+    if show_spy else
+    pd.DataFrame()
+)
+qqq_df = (
+    fetch_prices("QQQ", start=f"{start_year}-01-01")
+    if show_qqq else
+    pd.DataFrame()
+)
+
+returns_df = compute_returns(
+    first_cuts_rates,
+    px_df,
+    months_list,
+    px_spy=spy_df if not spy_df.empty else None,
+    px_qqq=qqq_df if not qqq_df.empty else None,
+)
 
 # -------------------------------
 # Tables
@@ -435,29 +529,32 @@ if returns_df.empty:
         "date range or lowering the cooldown."
     )
 else:
-    st.dataframe(returns_df.assign(date=returns_df.date.dt.date))
+    show_cols = [
+        "date", "title", "rate_lower", "rate_upper",
+        "rate_mid", "eff_rate", "delta_mid_bps",
+    ]
+    df_show = first_cuts_rates[show_cols].merge(
+        returns_df,
+        on="date",
+        how="left",
+        suffixes=("", ""),
+    )
+    df_show = df_show.sort_values("date")
+    df_show["date"] = df_show["date"].dt.date
+    st.dataframe(df_show)
+
     sel = [m for m in [1, 3, 6] if f"ret_{m}m" in returns_df.columns]
     if sel:
         cols = ["date", "title"] + [f"ret_{m}m" for m in sel]
         sub = returns_df[cols].copy()
         sub.columns = ["date", "title"] + [f"{m}m_%" for m in sel]
-        st.markdown("**1/3/6-month summary**")
+        st.markdown("**1/3/6-month summary (primary)**")
         st.dataframe(sub.assign(date=sub.date.dt.date))
 
 # -------------------------------
 # SPY/QQQ cycle performance
 # -------------------------------
 if not first_cuts.empty:
-    spy_df = (
-        fetch_prices("SPY", start=f"{start_year}-01-01")
-        if show_spy else
-        pd.DataFrame()
-    )
-    qqq_df = (
-        fetch_prices("QQQ", start=f"{start_year}-01-01")
-        if show_qqq else
-        pd.DataFrame()
-    )
     cycles, bars = [], []
     for i, r in first_cuts.reset_index(drop=True).iterrows():
         start_dt = r.date
@@ -493,7 +590,7 @@ else:
 # -------------------------------
 # Recession overlay chart
 # -------------------------------
-st.subheader("Index with recessions & cut markers")
+st.subheader("Index with recessions, rates & cut markers")
 fig = go.Figure()
 if not px_df.empty:
     fig.add_trace(
@@ -535,11 +632,67 @@ if not usrec.empty:
             opacity=0.15,
         )
 
+# add policy rate on a secondary axis
+if not rate_df.empty:
+    have_band = {"DFEDTARU", "DFEDTARL"}.issubset(rate_df.columns)
+    if have_band:
+        mid = (rate_df["DFEDTARU"] + rate_df["DFEDTARL"]) / 2.0
+        fig.add_trace(
+            go.Scatter(
+                x=mid.index,
+                y=mid.values,
+                name="Policy rate (mid, %)",
+                yaxis="y2",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=rate_df.index,
+                y=rate_df["DFEDTARU"],
+                name="Target upper",
+                yaxis="y2",
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=rate_df.index,
+                y=rate_df["DFEDTARL"],
+                name="Target lower",
+                yaxis="y2",
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(150,150,150,0.2)",
+                showlegend=False,
+            )
+        )
+    elif "FEDFUNDS" in rate_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=rate_df.index,
+                y=rate_df["FEDFUNDS"],
+                name="Effective Fed Funds (%)",
+                yaxis="y2",
+            )
+        )
+
 for _, r in first_cuts.iterrows():
     fig.add_vline(
         x=r.date,
         line=dict(color="red", dash="dash"),
     )
+
+fig.update_layout(
+    yaxis=dict(title=ticker),
+    yaxis2=dict(
+        title="Policy rate (%)",
+        overlaying="y",
+        side="right",
+    ),
+)
 
 st.plotly_chart(fig, use_container_width=True)
 
