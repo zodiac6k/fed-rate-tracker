@@ -429,7 +429,11 @@ def compute_returns(
     rows = []
     for _, r in first_cuts.iterrows():
         d = r.date
-        entry = {"date": d, "title": r.get("title", ""), "url": r.get("url", "")}
+        entry = {
+            "date": d,
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+        }
         for m in months_list:
             entry[f"ret_{m}m"] = fwd_return(px_main, d, m)
             if px_spy is not None:
@@ -440,6 +444,7 @@ def compute_returns(
 
     df = pd.DataFrame(rows).sort_values("date")
     return df
+
 
 
 # -------------------------------
