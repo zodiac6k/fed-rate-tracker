@@ -1,6 +1,6 @@
 streamlit==1.37.1
-pandas==2.0.3
-numpy==1.26.4
+pandas==2.0.3         # was 2.2.2
+numpy==1.24.4         # was 1.26.4
 yfinance==0.2.43
 feedparser==6.0.11
 beautifulsoup4==4.12.3
