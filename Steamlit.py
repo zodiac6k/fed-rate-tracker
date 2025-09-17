@@ -257,7 +257,7 @@ else:
     st.warning("No policy statements parsed from feed (check network or RSS changes).")
 
 first_cuts = identify_first_cuts(moves, cooldown)
-px_df = fetch_prices(ticker, start=f"{start_year}-01-01}")
+px_df = fetch_prices(ticker, start=f"{start_year}-01-01")
 # ^^^ OOPS guard: fix a stray brace if present; correct line should be:
 px_df = fetch_prices(ticker, start=f"{start_year}-01-01")  # NEW: ensure no stray brace
 returns_df = compute_returns(first_cuts, px_df, months_list)
