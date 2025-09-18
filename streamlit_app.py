@@ -1,4 +1,5 @@
-# streamlit_app.py — Fed Rate Cut Tracker & Macro Dashboard (no yfinance)
+# -*- coding: utf-8 -*-
+# streamlit_app.py — Fed Rate Cut Tracker & Macro Dashboard
 # ----------------------------------------------------------------------
 # Data sources:
 # - Fed press releases (Atom feed) + HTML fallback
@@ -22,6 +23,15 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
+
+# App config & tunables
+class Config:
+    DEFAULT_TICKER = "^GSPC"
+    DEFAULT_START_YEAR = 1990
+    CACHE_TTL = 3600
+    MAX_RETRIES = 3
+    REQUEST_TIMEOUT = 20
+
 
 # --- Config
 st.set_page_config(
@@ -67,12 +77,48 @@ REQUEST_KW = {
     "timeout": 20,
 }
 
+
+def safe_request(url: str, context: str = "", **kw) -> requests.Response:
+    """GET with headers, timeout, and better error context."""
+    try:
+        kwargs = dict(REQUEST_KW)
+        kwargs.update(kw)
+        r = requests.get(url, **kwargs)
+        r.raise_for_status()
+        return r
+    except requests.RequestException as e:
+        msg = f"Failed to fetch {context or url}: {e}"
+        st.warning(msg)
+        raise
+
+
+def validate_data_quality(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Warn on empty or very sparse frames."""
+    if df.empty:
+        st.warning(f"{name} is empty")
+        return df
+    cells = max(len(df) * max(len(df.columns), 1), 1)
+    nan_pct = df.isnull().sum().sum() / cells * 100.0
+    if nan_pct > 50:
+        st.warning(f"{name} has {nan_pct:.1f}% missing values")
+    return df
+
+
+def validate_ticker(ticker: str) -> str:
+    """Normalize user ticker."""
+    t = (ticker or "").strip().upper()
+    if not t:
+        st.warning("Ticker was empty; falling back to ^GSPC")
+        return Config.DEFAULT_TICKER
+    return t
+
+
 # -------------------------------
 # Helpers — FRED & Stooq
 # -------------------------------
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 def fred_csv(series_ids, start: str = "1980-01-01") -> pd.DataFrame:
     """
     Fetch one or more FRED series via fredgraph CSV.
@@ -81,8 +127,7 @@ def fred_csv(series_ids, start: str = "1980-01-01") -> pd.DataFrame:
     if isinstance(series_ids, str):
         series_ids = [series_ids]
     params = {"id": ",".join(series_ids)}
-    r = requests.get(FRED_CSV_BASE, params=params, **REQUEST_KW)
-    r.raise_for_status()
+    r = safe_request(FRED_CSV_BASE, "FRED CSV", params=params)
 
     df = pd.read_csv(io.StringIO(r.text))
     df.rename(columns={df.columns[0]: "DATE"}, inplace=True)
@@ -95,7 +140,7 @@ def fred_csv(series_ids, start: str = "1980-01-01") -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 def fetch_stooq_daily(
     symbol: str,
     start: str = "1985-01-01",
@@ -104,7 +149,7 @@ def fetch_stooq_daily(
     Download daily OHLCV from Stooq, e.g. 'spy.us', 'qqq.us'.
     """
     url = STQ_DAILY_URL.format(symbol=symbol)
-    r = requests.get(url, **REQUEST_KW)
+    r = safe_request(url, f"Stooq {symbol}")
     if r.status_code != 200 or not r.text or r.text.lower().startswith("html"):
         return pd.DataFrame()
     try:
@@ -124,7 +169,7 @@ def fetch_stooq_daily(
     return df[["close"]]
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 def fetch_prices(
     ticker: str,
     start: str = "1985-01-01",
@@ -165,7 +210,7 @@ def fetch_prices(
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 def fetch_policy_rates(start: str) -> pd.DataFrame:
     """
     Returns daily policy rate frame:
@@ -189,19 +234,19 @@ def nearest_value(df: pd.DataFrame, col: str, dt: pd.Timestamp) -> float:
         return float(df.iloc[idx][col])
     return np.nan
 
+
 # -------------------------------
 # Fed press releases — Atom + fallback
 # -------------------------------
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 def fetch_fed_press_releases() -> pd.DataFrame:
     rows = []
 
     # Atom feed first
     try:
-        r = requests.get(RSS_URL, **REQUEST_KW)
-        r.raise_for_status()
+        r = safe_request(RSS_URL, "Fed press RSS")
         root = ET.fromstring(r.content)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
 
@@ -221,7 +266,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
             if not link:
                 continue
             try:
-                html = requests.get(link, **REQUEST_KW).text
+                html = safe_request(link, "press page").text
                 soup = BeautifulSoup(html, "html.parser")
                 text = soup.get_text(" ", strip=True).lower()
             except Exception:
@@ -248,15 +293,13 @@ def fetch_fed_press_releases() -> pd.DataFrame:
                 }
             )
     except Exception as e:
-        msg = (
-            "RSS fetch failed "
-            f"({e}); attempting HTML fallback…"
-        )
-        st.warning(msg)
+        msg = "RSS fetch failed ({e}); attempting HTML fallback…"
+        st.warning(msg.format(e=e))
         try:
-            pr = requests.get(
-                "https://www.federalreserve.gov/newsevents/pressreleases.htm",
-                **REQUEST_KW,
+            pr = safe_request(
+                "https://www.federalreserve.gov/"
+                "newsevents/pressreleases.htm",
+                "press index",
             ).text
             soup = BeautifulSoup(pr, "html.parser")
             for a in soup.select("a"):
@@ -266,7 +309,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
                 starts_ok = href.startswith("/newsevents/pressreleases/")
                 if is_stmt and starts_ok:
                     link = f"https://www.federalreserve.gov{href}"
-                    page = requests.get(link, **REQUEST_KW).text
+                    page = safe_request(link, "press page").text
                     psoup = BeautifulSoup(page, "html.parser")
                     m = re.search(r"(\d{4})(\d{2})(\d{2})", href)
                     dt = pd.NaT
@@ -319,6 +362,7 @@ def fetch_fed_press_releases() -> pd.DataFrame:
         )
         df = df.loc[mask].reset_index(drop=True)
     return df
+
 
 # -------------------------------
 # Return math
@@ -446,14 +490,133 @@ def compute_returns(
     return df
 
 
+def compute_statistics(returns_df: pd.DataFrame) -> dict:
+    """Summary stats for numeric return cols."""
+    stats = {}
+    if returns_df.empty:
+        return stats
+    num = returns_df.select_dtypes(include=[np.number])
+    for col in num.columns:
+        if not (col.endswith("m") or col.endswith("%")):
+            continue
+        ser = num[col].dropna()
+        if ser.empty:
+            continue
+        stats[col] = {
+            "mean": float(ser.mean()),
+            "median": float(ser.median()),
+            "std": float(ser.std(ddof=0)),
+            "min": float(ser.min()),
+            "max": float(ser.max()),
+            "win_rate": float((ser > 0).mean() * 100.0),
+        }
+    return stats
+
+
+def create_performance_heatmap(returns_df: pd.DataFrame, period: str):
+    """Heatmap by year x month for one period col."""
+    if returns_df.empty or period not in returns_df.columns:
+        return
+    df = returns_df.copy()
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    pv = df.pivot_table(
+        values=period,
+        index="year",
+        columns="month",
+        aggfunc="mean",
+    )
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=pv.values,
+            x=list(pv.columns),
+            y=list(pv.index),
+            colorscale="RdYlGn",
+            colorbar=dict(title=period),
+        )
+    )
+    fig.update_layout(
+        title=f"{period} returns heatmap",
+        xaxis_title="Month",
+        yaxis_title="Year",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def add_export_buttons(df: pd.DataFrame, filename: str):
+    """CSV and JSON exports for a table."""
+    if df.empty:
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        csv = df.to_csv(index=False)
+        st.download_button(
+            "📄 Download CSV",
+            csv,
+            f"{filename}.csv",
+            "text/csv",
+        )
+    with c2:
+        j = df.to_json(orient="records", date_format="iso")
+        st.download_button(
+            "📋 Download JSON",
+            j,
+            f"{filename}.json",
+            "application/json",
+        )
+
+
+def comprehensive_tests(
+    moves: pd.DataFrame,
+    returns_df: pd.DataFrame,
+) -> list[str]:
+    """Extra checks; returns human messages."""
+    out = []
+    if not moves.empty:
+        gaps = moves["date"].diff().dt.days
+        big = (gaps > 180).sum()
+        if big:
+            out.append(f"Large gaps in statements: {big} > 180d")
+    if not returns_df.empty:
+        num = returns_df.select_dtypes(include=[np.number]).abs()
+        if (num > 100).any().any():
+            out.append("Extreme returns detected (>100%)")
+    return out
+
+
+def display_data_health(
+    moves: pd.DataFrame,
+    first_cuts: pd.DataFrame,
+    px_df: pd.DataFrame,
+):
+    """Mini data health panel."""
+    with st.expander("📊 Data health"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Fed statements", len(moves))
+            st.metric("First cuts", len(first_cuts))
+        with c2:
+            if not px_df.empty:
+                latest = float(px_df.iloc[-1]["close"])
+                base = float(px_df.iloc[0]["close"])
+                tot = (latest / base - 1.0) * 100.0
+                st.metric("Latest price", f"{latest:.2f}")
+                st.metric("Total return", f"{tot:.1f}%")
+        with c3:
+            if not moves.empty:
+                age = pd.Timestamp.now() - moves["date"].max()
+                st.metric("Data age", f"{age.days} days")
+
+
 # -------------------------------
 # Sidebar
 # -------------------------------
 st.sidebar.header("Controls")
 ticker = st.sidebar.text_input(
     "Primary Index/ETF (use ^GSPC, SPY, or QQQ)",
-    "^GSPC",
+    Config.DEFAULT_TICKER,
 )
+ticker = validate_ticker(ticker)
 show_spy = st.sidebar.checkbox("Add SPY", True)
 show_qqq = st.sidebar.checkbox("Add QQQ", True)
 cooldown = st.sidebar.slider(
@@ -471,11 +634,12 @@ start_year = st.sidebar.number_input(
     "Min year",
     1980,
     datetime.now().year,
-    1990,
+    Config.DEFAULT_START_YEAR,
 )
 if st.sidebar.button("🔄 Refresh"):
     st.cache_data.clear()
     st.rerun()
+
 
 # -------------------------------
 # Data pipeline
@@ -515,6 +679,15 @@ qqq_df = (
     pd.DataFrame()
 )
 
+# validate frames for user feedback
+moves = validate_data_quality(moves, "Fed statements")
+px_df = validate_data_quality(px_df, f"Prices {ticker}")
+rate_df = validate_data_quality(rate_df, "Policy rates")
+if show_spy:
+    spy_df = validate_data_quality(spy_df, "SPY")
+if show_qqq:
+    qqq_df = validate_data_quality(qqq_df, "QQQ")
+
 returns_df = compute_returns(
     first_cuts_rates,
     px_df,
@@ -522,6 +695,7 @@ returns_df = compute_returns(
     px_spy=spy_df if not spy_df.empty else None,
     px_qqq=qqq_df if not qqq_df.empty else None,
 )
+
 
 # -------------------------------
 # Tables
@@ -546,6 +720,7 @@ else:
     df_show = df_show.sort_values("date")
     df_show["date"] = df_show["date"].dt.date
     st.dataframe(df_show)
+    add_export_buttons(df_show, "first_cuts_returns")
 
     sel = [m for m in [1, 3, 6] if f"ret_{m}m" in returns_df.columns]
     if sel:
@@ -554,6 +729,17 @@ else:
         sub.columns = ["date", "title"] + [f"{m}m_%" for m in sel]
         st.markdown("**1/3/6-month summary (primary)**")
         st.dataframe(sub.assign(date=sub.date.dt.date))
+
+    stats = compute_statistics(returns_df)
+    with st.expander("📐 Return statistics"):
+        if stats:
+            st.json(stats)
+        else:
+            st.caption("No stats available.")
+
+    for p in ["ret_1m", "ret_3m", "ret_6m"]:
+        create_performance_heatmap(returns_df, p)
+
 
 # -------------------------------
 # SPY/QQQ cycle performance
@@ -590,6 +776,7 @@ if not first_cuts.empty:
         st.dataframe(perf)
 else:
     st.caption("Cycle performance table hidden — no first cuts in range.")
+
 
 # -------------------------------
 # Recession overlay chart
@@ -700,6 +887,7 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
+
 # -------------------------------
 # Macro fallback (simple chart)
 # -------------------------------
@@ -720,9 +908,12 @@ try:
 except Exception as e:
     st.warning(f"Macro fetch failed: {e}")
 
+
 # -------------------------------
-# Sanity tests
+# Data health + Sanity tests
 # -------------------------------
+display_data_health(moves, first_cuts, px_df)
+
 with st.expander("🔧 Run sanity tests"):
     if st.button("Run tests now"):
         try:
@@ -739,6 +930,9 @@ with st.expander("🔧 Run sanity tests"):
                 assert ok_sorted, "first_cuts not sorted"
             assert isinstance(returns_df, pd.DataFrame), \
                 "returns_df not DataFrame"
+            msgs = comprehensive_tests(moves, returns_df)
+            for m in msgs:
+                st.warning(m)
             st.success("All sanity tests passed.")
         except AssertionError as ae:
             st.error(f"Test failed: {ae}")
