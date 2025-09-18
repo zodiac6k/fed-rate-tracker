@@ -24,6 +24,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 
+
 # App config & tunables
 class Config:
     DEFAULT_TICKER = "^GSPC"
